@@ -51,7 +51,29 @@
   <div class="controls">
     <button id="start">Start listening</button>
     <button id="reset">Reset</button>
-    <label>Sensitivity <input id="sensitivity" type="range" min="0" max="100" value="60"></label>
+    <label>Settings
+      <select id="mode">
+        <option value="auto" selected>Auto</option>
+        <option value="manual">Manual</option>
+      </select>
+    </label>
+    <label>Sensitivity <input id="sensitivity" type="range" min="0" max="100" value="50"></label>
+    <label>Measure over last
+      <select id="beatWindow">
+        <option value="10">10 beats</option>
+        <option value="20" selected>20 beats</option>
+        <option value="40">40 beats</option>
+        <option value="60">60 beats</option>
+      </select>
+    </label>
+    <label>Low cut
+      <select id="lowcut">
+        <option value="150">150 Hz</option>
+        <option value="400">400 Hz</option>
+        <option value="1000" selected>1 kHz</option>
+        <option value="2500">2.5 kHz</option>
+      </select>
+    </label>
     <label>Beat every
       <select id="period">
         <option value="auto">auto-detect</option>
@@ -69,12 +91,13 @@
   </div>
 
   <div id="status" class="status">Press “Start listening” and allow microphone access.</div>
+  <div id="autoInfo" class="note"></div>
 
   <div class="grid">
     <div class="card">
       <h2>Rate</h2>
       <div class="big" id="rate">–</div>
-      <div class="note"><span id="rateNote">seconds per day</span> (s/day)</div>
+      <div class="note"><span id="rateNote">seconds per day</span> (s/day) · <span id="rateBeatsLabel">last 20 beats</span></div>
       <dl>
         <dt>Last minute</dt><dd id="rate1">–</dd>
         <dt>Last 10 minutes</dt><dd id="rate10">–</dd>
@@ -101,7 +124,7 @@
     <canvas id="scope"></canvas>
   </div>
   <div class="card" style="margin-bottom:12px">
-    <h2>Each interval vs. the beat period (last minute)</h2>
+    <h2>Each interval vs. the beat period (last few beats)</h2>
     <canvas id="intervals"></canvas>
   </div>
   <div class="card">

@@ -18,13 +18,11 @@ class Detector {
     this.onEvent = onEvent;
     this.n = 0;                 // absolute index of the next sample
     this.env = 0;               // smoothed rectified signal
-    this.floor = 0;             // running noise-floor estimate
-    this.mult = 8;              // threshold = floor * mult
-    this.minThr = 1e-4;         // never trigger on digital silence
+    this.floor = 0;             // noise-floor estimate (median of recent peaks)
+    this.mult = 3.4;            // threshold = floor * mult
+    this.minThr = 1e-5;         // never trigger on digital silence
     this.atk = 1 - Math.exp(-1 / (0.0003 * sampleRate));
     this.rel = 1 - Math.exp(-1 / (0.002 * sampleRate));
-    this.floorSlow = 1 - Math.exp(-1 / (2 * sampleRate));
-    this.floorFast = 1 - Math.exp(-1 / (0.05 * sampleRate));
     this.warmup = Math.round(0.5 * sampleRate);
     this.winLen = Math.round(0.03 * sampleRate);   // event analysis window
     this.lockLen = Math.round(0.12 * sampleRate);  // dead time after onset
@@ -58,12 +56,10 @@ class Detector {
       if (this.bins.length > this.maxBins) this.bins.shift();
       this.binCount = 0;
       this.binMax = 0;
+      if (this.bins.length % 20 === 0) this.updateFloor();
     }
 
-    if (n < this.warmup) {
-      this.floor += (env - this.floor) * this.floorFast;
-      return;
-    }
+    if (n < this.warmup) return;
 
     if (this.inWindow) {
       this.win.push(env);
@@ -76,9 +72,15 @@ class Detector {
       this.inWindow = true;
       this.winStart = n;
       this.win = [env];
-    } else if (env < thr) {
-      this.floor += (env - this.floor) * this.floorSlow;
     }
+  }
+
+  // Noise floor = median of the last ~4 s of 5 ms peak-envelope bins. Ticks
+  // fill only a small part of that time, so the median ignores them and
+  // tracks the background noise however quiet the ticks are.
+  updateFloor() {
+    const recent = this.bins.slice(-800).sort((a, b) => a - b);
+    this.floor = recent[recent.length >> 1];
   }
 
   // Timestamp = where the envelope first reaches 50% of its peak, with linear
@@ -154,7 +156,7 @@ class BeatAnalyser {
     const lastH = this.history[this.history.length - 1];
     if (!lastH || e.t - lastH.t >= 5) {
       const r = this.rate(SHORT_WINDOW);
-      if (r) this.history.push({ t: e.t, rate: r.secPerDay });
+      if (r && r.count >= 20) this.history.push({ t: e.t, rate: r.secPerDay });
     }
   }
 
@@ -164,29 +166,48 @@ class BeatAnalyser {
     return this.events.filter(ev => ev.t >= last.t - seconds);
   }
 
-  // Least-squares fit of time against beat number: slope = measured period.
   rate(seconds) {
-    const evs = this.window(seconds);
+    return this.fit(this.window(seconds), 8);
+  }
+
+  rateBeats(beats) {
+    return this.fit(this.events.slice(-beats), 6);
+  }
+
+  // Least-squares fit t = a + period * n + c * (±1 by tick/tock parity).
+  // The parity term absorbs the beat error, so an uneven tick-tock doesn't
+  // bias the period or inflate its uncertainty, even over a few beats.
+  fit(evs, minCount) {
     const m = evs.length;
-    if (m < 8 || !this.nominal) return null;
-    let sn = 0, st = 0;
-    for (const e of evs) { sn += e.n; st += e.t; }
-    const mn = sn / m, mt = st / m;
-    let sxx = 0, sxy = 0;
-    for (const e of evs) { sxx += (e.n - mn) ** 2; sxy += (e.n - mn) * (e.t - mt); }
-    if (sxx === 0) return null;
-    const period = sxy / sxx;
+    if (m < minCount || !this.nominal) return null;
+    const n0 = evs[0].n, t0 = evs[0].t;
+    const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], r = [0, 0, 0];
+    const rows = evs.map(e => [[1, e.n - n0, e.n % 2 ? -1 : 1], e.t - t0]);
+    for (const [x, y] of rows) {
+      for (let i = 0; i < 3; i++) {
+        r[i] += x[i] * y;
+        for (let j = 0; j < 3; j++) S[i][j] += x[i] * x[j];
+      }
+    }
+    const coef = solve3(S, r);
+    const unit = solve3(S, [0, 1, 0]);   // column of S⁻¹ for the period's variance
+    if (!coef || !unit) return null;
+    const [a, period, c] = coef;
+    let ss = 0;
+    for (const [x, y] of rows) ss += (y - a - period * x[1] - c * x[2]) ** 2;
+    const periodErr = m > 3 ? Math.sqrt(ss / (m - 3) * unit[1]) : 0;
     return {
       period,
       beatsPerHour: 3600 / period,
       secPerDay: (this.nominal / period - 1) * 86400,
+      secPerDayErr: this.nominal / (period * period) * periodErr * 86400,
       count: m,
     };
   }
 
   // Compare tick->tock (A) with tock->tick (B) intervals.
-  beatError(seconds = SHORT_WINDOW) {
-    const evs = this.window(seconds);
+  beatError(beats = 20) {
+    const evs = this.events.slice(-beats);
     const A = [], B = [];
     for (let i = 1; i < evs.length; i++) {
       if (evs[i].n - evs[i - 1].n !== 1) continue;
@@ -199,8 +220,8 @@ class BeatAnalyser {
   }
 
   // Consecutive intervals as deviation from nominal in ms, for the chart.
-  intervals(seconds = SHORT_WINDOW) {
-    const evs = this.window(seconds);
+  intervals(beats = 20) {
+    const evs = this.events.slice(-beats);
     const out = [];
     for (let i = 1; i < evs.length; i++) {
       if (evs[i].n - evs[i - 1].n !== 1) continue;
@@ -208,6 +229,23 @@ class BeatAnalyser {
     }
     return out;
   }
+}
+
+// Solve a 3x3 linear system by Gaussian elimination with partial pivoting.
+function solve3(A, b) {
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < 3; col++) {
+    let p = col;
+    for (let i = col + 1; i < 3; i++) if (Math.abs(M[i][col]) > Math.abs(M[p][col])) p = i;
+    if (Math.abs(M[p][col]) < 1e-12) return null;
+    [M[col], M[p]] = [M[p], M[col]];
+    for (let i = 0; i < 3; i++) {
+      if (i === col) continue;
+      const f = M[i][col] / M[col][col];
+      for (let j = col; j < 4; j++) M[i][j] -= f * M[col][j];
+    }
+  }
+  return M.map((row, i) => row[3] / row[i]);
 }
 
 function mean(a) { return a.reduce((s, v) => s + v, 0) / a.length; }
@@ -231,20 +269,20 @@ function snapPeriod(p) {
 // Intervals alternate A, B, A, B...
 
 class SynthSource {
-  constructor(sr, A, B, noise = 0.004) {
-    this.sr = sr; this.A = A; this.B = B; this.noise = noise;
+  constructor(sr, A, B, noise = 0.004, freq = 3000, hum = 0) {
+    this.sr = sr; this.A = A; this.B = B; this.noise = noise; this.freq = freq; this.hum = hum;
     this.pos = 0; this.k = 0; this.nextT = 0.3; this.active = [];
   }
   read(count) {
     const out = new Float32Array(count);
-    const w = 2 * Math.PI * 3000;
+    const w = 2 * Math.PI * this.freq;
     for (let i = 0; i < count; i++) {
       const t = (this.pos + i) / this.sr;
       while (t >= this.nextT) {
         this.active.push(this.nextT);
         this.nextT += this.k++ % 2 === 0 ? this.A : this.B;
       }
-      let v = (Math.random() * 2 - 1) * this.noise;
+      let v = (Math.random() * 2 - 1) * this.noise + this.hum * Math.sin(2 * Math.PI * 50 * t);
       for (let j = this.active.length - 1; j >= 0; j--) {
         const dt = t - this.active[j];
         if (dt > 0.1) { this.active.splice(j, 1); continue; }
@@ -258,7 +296,135 @@ class SynthSource {
   }
 }
 
-if (typeof module !== 'undefined') module.exports = { Detector, BeatAnalyser, SynthSource };
+// -------------------------------------------------------------- Auto-tuning
+// Runs the detector at several low-cut filters and thresholds at once, and
+// picks the combination whose events look most like a steady clock.
+
+class Biquad {   // RBJ high-pass
+  constructor(sr, f, Q = 0.707) {
+    const w = 2 * Math.PI * f / sr, c = Math.cos(w), al = Math.sin(w) / (2 * Q), a0 = 1 + al;
+    this.b0 = (1 + c) / 2 / a0; this.b1 = -(1 + c) / a0; this.b2 = this.b0;
+    this.a1 = -2 * c / a0; this.a2 = (1 - al) / a0;
+    this.x1 = this.x2 = this.y1 = this.y2 = 0;
+  }
+  run(inp, out) {
+    for (let i = 0; i < inp.length; i++) {
+      const x = inp[i];
+      const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+      this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y;
+      out[i] = y;
+    }
+  }
+}
+
+// How clock-like are these event times? 1 = every beat found, evenly spaced,
+// nothing extra. Penalises both noise events and missed beats.
+const SCORE_WINDOW = 20;   // seconds
+
+function regularity(times, now, fixedPeriod) {
+  const span = Math.min(SCORE_WINDOW, now - 0.5);
+  const ts = times.filter(t => t >= now - SCORE_WINDOW);
+  if (ts.length < 6) return { score: 0, period: 0 };
+  const d = [];
+  for (let i = 1; i < ts.length; i++) d.push(ts[i] - ts[i - 1]);
+  const sorted = d.slice().sort((a, b) => a - b);
+  const period = fixedPeriod || sorted[sorted.length >> 1];
+  if (period < 0.15 || period > 3) return { score: 0, period };
+  let good = 0;
+  for (const x of d) if (Math.abs(x - period) <= 0.2 * period) good++;
+  return { score: Math.min(1, good / Math.max(d.length, span / period - 1)), period };
+}
+
+const samePeriod = (a, b) => a / b > 0.85 && a / b < 1.18;
+
+class Bank {
+  constructor(sampleRate, onActiveEvent, onSwitch) {
+    this.sr = sampleRate;
+    this.onActiveEvent = onActiveEvent;
+    this.onSwitch = onSwitch;          // (detector, periodChanged)
+    this.cuts = [150, 400, 1000, 2500];
+    this.mults = [1.8, 2.5, 3.5, 5, 8];
+    this.auto = true;
+    this.fixedPeriod = null;
+    this.firstEval = 12;               // seconds of audio before the first decision
+    this.nextEval = this.firstEval;
+    this.info = { score: 0, searching: true };
+    this.branches = this.cuts.map(cut => {
+      const br = { cut, filter: new Biquad(sampleRate, cut), buf: new Float32Array(0), dets: [] };
+      br.dets = this.mults.map(m => {
+        const d = new Detector(sampleRate, (t, amp) => this.handle(d, t, amp));
+        d.baseMult = d.mult = m;
+        d.recent = [];
+        d.branch = br;
+        return d;
+      });
+      return br;
+    });
+    this.active = this.branches[2].dets[2];   // 1 kHz, x3.5 until auto decides
+  }
+
+  get now() { return this.active.n / this.sr; }
+
+  handle(d, t, amp) {
+    d.recent.push(t);
+    while (d.recent.length && d.recent[0] < t - 40) d.recent.shift();
+    if (d === this.active) this.onActiveEvent(t, amp);
+  }
+
+  push(samples, start) {
+    for (const br of this.branches) {
+      if (br.buf.length !== samples.length) br.buf = new Float32Array(samples.length);
+      br.filter.run(samples, br.buf);
+      for (const d of br.dets) d.push(br.buf, start);
+    }
+    if (this.auto && this.now >= this.nextEval) {
+      this.nextEval = this.now + 3;
+      this.evaluate();
+    }
+  }
+
+  evaluate() {
+    const now = this.now;
+    const all = [];
+    for (const br of this.branches) {
+      for (const d of br.dets) all.push({ d, ...regularity(d.recent, now, this.fixedPeriod) });
+    }
+    const cur = all.find(r => r.d === this.active);
+    const best = Math.max(...all.map(r => r.score));
+    this.info = { score: cur.score, searching: best < 0.5 };
+    if (best < 0.5) return;
+
+    // Among near-best candidates prefer the one hearing the most beats per
+    // second (so tick *and* tock), then the highest threshold (most robust).
+    const near = all.filter(r => r.score >= best - 0.08);
+    near.sort((a, b) => samePeriod(a.period, b.period) ? b.d.baseMult - a.d.baseMult : a.period - b.period);
+    const pick = near[0];
+    if (pick.d === this.active) return;
+    if (pick.score > cur.score + 0.1 || pick.period < cur.period * 0.75 || cur.score < 0.5) {
+      this.active = pick.d;
+      this.info = { score: pick.score, searching: false };
+      this.onSwitch(pick.d, !(cur.period && samePeriod(pick.period, cur.period)));
+    }
+  }
+
+  setAuto() {
+    this.auto = true;
+    for (const br of this.branches) for (const d of br.dets) d.mult = d.baseMult;
+    this.nextEval = this.now;
+  }
+
+  setManual(cutIndex, mult) {
+    this.auto = false;
+    const d = this.branches[cutIndex].dets[0];
+    d.mult = mult;
+    if (d !== this.active) {
+      this.active = d;
+      this.onSwitch(d, false);
+    }
+  }
+}
+
+if (typeof module !== 'undefined') module.exports = { Detector, BeatAnalyser, SynthSource, Bank };
 
 // ---------------------------------------------------------------------- UI
 
@@ -286,26 +452,57 @@ function initUI() {
   const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const params = new URLSearchParams(location.search);
 
-  let ctx = null, stream = null, detector = null, analyser = null, synth = null, demoTimer = null;
+  let ctx = null, stream = null, bank = null, detector = null, analyser = null, synth = null, demoTimer = null;
   let lastEventAudioTime = -Infinity;
   let scopeMax = 0.01;
 
   const sensitivity = $('sensitivity');
   const periodSel = $('period');
+  const beatWindow = () => parseInt($('beatWindow').value, 10);
 
-  function newSession(sampleRate) {
-    analyser = new BeatAnalyser(periodSel.value === 'auto' ? null : parseFloat(periodSel.value));
-    detector = new Detector(sampleRate, (t, amp) => {
-      analyser.add(t, amp);
-      lastEventAudioTime = t;
-    });
-    applySensitivity();
+  const isAuto = () => $('mode').value === 'auto';
+  const currentPeriod = () => periodSel.value === 'auto' ? null : parseFloat(periodSel.value);
+  const multFromSlider = () => 10 * Math.pow(1.15 / 10, parseFloat(sensitivity.value) / 100);  // 0 -> x10, 100 -> x1.15
+  const sliderFromMult = m => Math.max(0, Math.min(100, Math.round(100 * Math.log(m / 10) / Math.log(1.15 / 10))));
+
+  function newAnalyser() {
+    analyser = new BeatAnalyser(currentPeriod());
   }
 
-  function applySensitivity() {
-    if (!detector) return;
-    const v = parseFloat(sensitivity.value) / 100;
-    detector.mult = 40 * Math.pow(3 / 40, v);   // 0 -> x40 (least sensitive), 100 -> x3
+  function newSession(sampleRate) {
+    newAnalyser();
+    bank = new Bank(sampleRate, (t, amp) => {
+      analyser.add(t, amp);
+      lastEventAudioTime = t;
+    }, (det, periodChanged) => {
+      detector = det;
+      if (periodChanged) newAnalyser();
+    });
+    bank.fixedPeriod = currentPeriod();
+    detector = bank.active;
+    applyMode();
+  }
+
+  // Auto: the bank picks low cut + threshold. Manual: sliders drive them.
+  function applyMode() {
+    if (!bank) return;
+    if (isAuto()) bank.setAuto();
+    else bank.setManual(bank.cuts.indexOf(parseFloat($('lowcut').value)), multFromSlider());
+    detector = bank.active;
+  }
+
+  function showAutoState() {
+    const auto = isAuto();
+    sensitivity.disabled = $('lowcut').disabled = auto;
+    const info = $('autoInfo');
+    if (!bank || !auto) { info.textContent = ''; return; }
+    const d = bank.active;
+    $('lowcut').value = String(d.branch.cut);
+    sensitivity.value = String(sliderFromMult(d.mult));
+    const wait = Math.ceil(bank.firstEval - bank.now);
+    if (wait > 0) info.textContent = 'Auto: listening for ' + wait + ' s to choose settings…';
+    else if (bank.info.searching) info.textContent = 'Auto: no regular ticking found yet. Move the mic closer to the clock and keep the room quiet.';
+    else info.textContent = 'Auto: using ' + d.branch.cut + ' Hz low cut, threshold ×' + d.mult + ' (' + Math.round(bank.info.score * 100) + '% of beats steady).';
   }
 
   async function start() {
@@ -321,12 +518,10 @@ function initUI() {
 
       newSession(ctx.sampleRate);
       const src = ctx.createMediaStreamSource(stream);
-      const hp = ctx.createBiquadFilter();
-      hp.type = 'highpass'; hp.frequency.value = 1000; hp.Q.value = 0.707;
       const node = new AudioWorkletNode(ctx, 'tick-capture');
       const mute = ctx.createGain(); mute.gain.value = 0;
-      src.connect(hp); hp.connect(node); node.connect(mute); mute.connect(ctx.destination);
-      node.port.onmessage = e => detector.push(e.data.samples, e.data.start);
+      src.connect(node); node.connect(mute); mute.connect(ctx.destination);
+      node.port.onmessage = e => bank.push(e.data.samples, e.data.start);
 
       $('start').textContent = 'Stop';
       $('start').disabled = false;
@@ -353,8 +548,8 @@ function initUI() {
     const sr = 48000;
     newSession(sr);
     synth = new SynthSource(sr, 0.49005, 0.51005);
-    for (let i = 0; i < 120; i++) detector.push(synth.read(sr));
-    demoTimer = setInterval(() => detector.push(synth.read(sr / 10)), 100);
+    for (let i = 0; i < 120; i++) bank.push(synth.read(sr));
+    demoTimer = setInterval(() => bank.push(synth.read(sr / 10)), 100);
     $('start').disabled = true;
     $('start').textContent = 'Demo running';
   }
@@ -372,11 +567,12 @@ function initUI() {
 
   function updateReadouts() {
     if (!analyser) return;
+    showAutoState();
     const now = detector.n / detector.sr;
     const heard = now - lastEventAudioTime < 3;
     const r1 = analyser.rate(SHORT_WINDOW);
     const r10 = analyser.rate(LONG_WINDOW);
-    const be = analyser.beatError();
+    const be = analyser.beatError(beatWindow());
 
     if (now < 1) setStatus('Calibrating noise floor…', '');
     else if (!analyser.events.length && !analyser.pending.length) setStatus('Listening – no ticks heard yet. Move the mic closer or raise sensitivity.', 'warn');
@@ -384,9 +580,10 @@ function initUI() {
     else if (!r1) setStatus('Hearing ticks, collecting data…', '');
     else setStatus('Tracking · ' + analyser.events.length + ' beats', 'good');
 
-    const main = r10 && r10.count >= 120 ? r10 : r1;
+    const main = analyser.rateBeats(beatWindow());
     $('rate').textContent = main ? sign(main.secPerDay) : '–';
-    $('rateNote').textContent = main ? (Math.abs(main.secPerDay) < 0.5 ? 'on time' : main.secPerDay > 0 ? 'running fast' : 'running slow') : 'seconds per day';
+    $('rateBeatsLabel').textContent = 'last ' + beatWindow() + ' beats' + (main ? ', ± ' + fmt(main.secPerDayErr, 1) : '');
+    $('rateNote').textContent = main ? (Math.abs(main.secPerDay) <= Math.max(0.5, main.secPerDayErr) ? 'on time' : main.secPerDay > 0 ? 'running fast' : 'running slow') : 'seconds per day';
     $('rate1').textContent = r1 ? sign(r1.secPerDay) + ' s/day' : '–';
     $('rate10').textContent = r10 ? sign(r10.secPerDay) + ' s/day' : '–';
 
@@ -467,7 +664,7 @@ function initUI() {
   function drawIntervals() {
     const { c, w, h } = prep($('intervals'));
     if (!analyser || !analyser.nominal) return;
-    const pts = analyser.intervals();
+    const pts = analyser.intervals(beatWindow());
     let range = 5;
     for (const p of pts) range = Math.max(range, Math.abs(p.dev) * 1.15);
     const y = v => h / 2 - v / range * (h / 2 - 14);
@@ -528,11 +725,13 @@ function initUI() {
 
   $('start').onclick = start;
   $('reset').onclick = () => {
-    if (!detector) return;
-    analyser = new BeatAnalyser(periodSel.value === 'auto' ? null : parseFloat(periodSel.value));
-    detector.onEvent = (t, amp) => { analyser.add(t, amp); lastEventAudioTime = t; };
+    if (!bank) return;
+    newAnalyser();
+    bank.fixedPeriod = currentPeriod();
   };
-  sensitivity.oninput = applySensitivity;
+  sensitivity.oninput = applyMode;
+  $('lowcut').onchange = applyMode;
+  $('mode').onchange = applyMode;
   periodSel.onchange = $('reset').onclick;
 
   if (!navigator.mediaDevices) setStatus('Microphone access needs https or http://localhost – see README.', 'bad');
