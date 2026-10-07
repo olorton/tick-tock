@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tick-Tock Clock Analyser</title>
+<style>
+  :root {
+    --bg: #f6f4ef; --card: #ffffff; --text: #22201c; --muted: #7a756b; --grid: #d9d5cb;
+    --accent: #2b6cb0; --accent-soft: rgba(43,108,176,.28);
+    --tick: #d9480f; --tock: #1c7ed6;
+    --good: #2f9e44; --warn: #e67700; --bad: #c92a2a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17160f; --card: #211f17; --text: #ece8dc; --muted: #9a9484; --grid: #3a372c;
+      --accent: #74b0f0; --accent-soft: rgba(116,176,240,.3);
+      --tick: #ff922b; --tock: #74c0fc;
+      --good: #69db7c; --warn: #ffa94d; --bad: #ff8787;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 16px; color: var(--muted); }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+  .controls label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+  button, select { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--grid); background: var(--card); color: var(--text); cursor: pointer; }
+  button#start { background: var(--accent); color: #fff; border-color: transparent; }
+  button:disabled { opacity: .6; cursor: default; }
+  .status { padding: 8px 12px; border-radius: 8px; background: var(--card); margin-bottom: 12px; color: var(--muted); }
+  .status.good { color: var(--good); } .status.warn { color: var(--warn); } .status.bad { color: var(--bad); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .card { background: var(--card); border-radius: 12px; padding: 14px 16px; }
+  .card h2 { font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+  .big { font-size: 44px; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .big.good { color: var(--good); } .big.warn { color: var(--warn); } .big.bad { color: var(--bad); }
+  .note { color: var(--muted); margin-bottom: 8px; }
+  dl { margin: 0; display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; height: 150px; display: block; }
+  footer { color: var(--muted); font-size: 13px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tick-Tock Clock Analyser</h1>
+  <p class="sub">Listens to a pendulum clock through the microphone and measures how evenly it ticks and how fast it runs.</p>
+
+  <div class="controls">
+    <button id="start">Start listening</button>
+    <button id="reset">Reset</button>
+    <label>Sensitivity <input id="sensitivity" type="range" min="0" max="100" value="60"></label>
+    <label>Beat every
+      <select id="period">
+        <option value="auto">auto-detect</option>
+        <option value="0.25">0.25 s</option>
+        <option value="0.4">0.4 s</option>
+        <option value="0.5">0.5 s</option>
+        <option value="0.6">0.6 s</option>
+        <option value="0.75">0.75 s</option>
+        <option value="1">1 s</option>
+        <option value="1.25">1.25 s</option>
+        <option value="1.5">1.5 s</option>
+        <option value="2">2 s</option>
+      </select>
+    </label>
+  </div>
+
+  <div id="status" class="status">Press “Start listening” and allow microphone access.</div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Rate</h2>
+      <div class="big" id="rate">–</div>
+      <div class="note"><span id="rateNote">seconds per day</span> (s/day)</div>
+      <dl>
+        <dt>Last minute</dt><dd id="rate1">–</dd>
+        <dt>Last 10 minutes</dt><dd id="rate10">–</dd>
+        <dt>Measured beat</dt><dd id="period1">–</dd>
+        <dt>Beats per hour</dt><dd id="bph">–</dd>
+        <dt>Assumed beat</dt><dd id="nominal">–</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h2>Beat error (evenness)</h2>
+      <div class="big" id="beatErr">–</div>
+      <div class="note" id="beatErrNote">milliseconds</div>
+      <dl>
+        <dt>Tick → tock</dt><dd id="meanA">–</dd>
+        <dt>Tock → tick</dt><dd id="meanB">–</dd>
+        <dt>Timing jitter</dt><dd id="jitter">–</dd>
+        <dt>Rejected noise events</dt><dd id="rejected">0</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:12px">
+    <h2>Microphone signal (high-passed)</h2>
+    <canvas id="scope"></canvas>
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <h2>Each interval vs. the beat period (last minute)</h2>
+    <canvas id="intervals"></canvas>
+  </div>
+  <div class="card">
+    <h2>Rate over time</h2>
+    <canvas id="drift"></canvas>
+  </div>
+
+  <footer>
+    Beat error is half the difference between the tick→tock and tock→tick times; a perfectly even clock reads 0.
+    Rate is measured against the sound card’s clock, which is typically good to a few tens of ppm (a couple of seconds a day),
+    so treat differences smaller than that with care. Place the phone/mic near the clock case and keep other noise down.
+    Add <code>?demo</code> to the URL to see synthetic data.
+  </footer>
+</main>
+<script src="tick.js"></script>
+</body>
+</html>
