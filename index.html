@@ -114,6 +114,7 @@
         <dt>Tick → tock</dt><dd id="meanA">–</dd>
         <dt>Tock → tick</dt><dd id="meanB">–</dd>
         <dt>Timing jitter</dt><dd id="jitter">–</dd>
+        <dt>Beats heard (last 20 s)</dt><dd id="heard">–</dd>
         <dt>Rejected noise events</dt><dd id="rejected">0</dd>
       </dl>
     </div>
@@ -121,6 +122,7 @@
 
   <div class="card" style="margin-bottom:12px">
     <h2>Microphone signal (high-passed)</h2>
+    <div class="note">Coloured lines are beats used for the readings; grey lines are sounds the detector picked up but rejected as noise.</div>
     <canvas id="scope"></canvas>
   </div>
   <div class="card" style="margin-bottom:12px">
